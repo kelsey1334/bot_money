@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO)
 # Kết nối Google Sheets
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 SHEET_NAME = "Chi tiêu cá nhân"
-creds = Credentials.from_service_account_file("rosy-cache-462916-t6-3ffc8419440e.json", scopes=SCOPES)
+creds = Credentials.from_service_account_file("rosy-cache-462916-t6-be560f1dfced.json", scopes=SCOPES)
 client = gspread.authorize(creds)
 sheet = client.open(SHEET_NAME)
 sheet_thu = sheet.worksheet("Thu")
