@@ -1,90 +1,118 @@
-import logging
+import os
 import json
+import logging
+import asyncio
 from datetime import datetime, timedelta
-from pytz import timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+    ContextTypes
+)
 import gspread
 from google.oauth2.service_account import Credentials
 
-# Cấu hình logging
+# === Logging ===
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Kết nối Google Sheets
+# === Google Sheets Setup ===
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
-SHEET_NAME = "Chi tiêu cá nhân"
-creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
-client = gspread.authorize(creds)
-sheet = client.open(SHEET_NAME)
-sheet_thu = sheet.worksheet("Thu")
-sheet_chi = sheet.worksheet("Chi")
+creds_json = os.getenv("GOOGLE_CREDS")
+creds = Credentials.from_service_account_info(json.loads(creds_json), scopes=SCOPES)
+gc = gspread.authorize(creds)
 
-# Biến lưu tạm số tiền chờ người dùng chọn danh mục
-pending_data = {}
+SHEET_NAME = os.getenv("SHEET_NAME", "ChiTieu")
+worksheet = gc.open(SHEET_NAME).sheet1
 
-# Hàm lưu dữ liệu vào Google Sheets
-def save_transaction_to_sheets(user_id, amount, category, trans_type):
-    today = datetime.now(timezone('Asia/Ho_Chi_Minh')).strftime("%Y-%m-%d")
-    row = [today, str(user_id), amount, category]
-    if trans_type == "in":
-        sheet_thu.append_row(row)
-    else:
-        sheet_chi.append_row(row)
+# === Category Options ===
+IN_CATEGORIES = ["Lương", "Bán hàng", "Thu nợ", "Được cho"]
+OUT_CATEGORIES = ["Tiền đi lại", "Ăn uống", "Mua sắm", "Y tế", "Việc riêng", "Đi chơi"]
 
-# Lệnh /start
+# === Store temporary data ===
+user_data = {}
+
+# === /start ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Chào bạn! Nhập /in [số tiền] hoặc /out [số tiền] để ghi chi tiêu nhé.")
+    await update.message.reply_text("Chào bạn! Dùng /in hoặc /out để ghi thu chi.")
 
-# Lệnh /in
-async def income(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# === /in ===
+async def handle_in(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        amount = int(context.args[0])
-        user_id = update.message.from_user.id
-        pending_data[user_id] = {"amount": amount, "type": "in"}
-        keyboard = [[InlineKeyboardButton(cat, callback_data=cat)] for cat in ["Lương", "Bán hàng", "Thu nợ", "Được cho"]]
-        await update.message.reply_text("Nguồn tiền từ đâu?", reply_markup=InlineKeyboardMarkup(keyboard))
+        amount = float(context.args[0])
     except:
-        await update.message.reply_text("Sai cú pháp. Hãy dùng: /in [số tiền]")
+        await update.message.reply_text("Vui lòng nhập số tiền: /in 500000")
+        return
+    keyboard = [[InlineKeyboardButton(cat, callback_data=f"in|{amount}|{cat}")]
+                for cat in IN_CATEGORIES]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Nguồn tiền đến từ đâu?", reply_markup=reply_markup)
 
-# Lệnh /out
-async def expense(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# === /out ===
+async def handle_out(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        amount = int(context.args[0])
-        user_id = update.message.from_user.id
-        pending_data[user_id] = {"amount": amount, "type": "out"}
-        keyboard = [[InlineKeyboardButton(cat, callback_data=cat)] for cat in ["Tiền đi lại", "Ăn uống", "Mua sắm", "Y tế", "Việc riêng", "Đi chơi"]]
-        await update.message.reply_text("Khoản chi này là gì?", reply_markup=InlineKeyboardMarkup(keyboard))
+        amount = float(context.args[0])
     except:
-        await update.message.reply_text("Sai cú pháp. Hãy dùng: /out [số tiền]")
+        await update.message.reply_text("Vui lòng nhập số tiền: /out 200000")
+        return
+    keyboard = [[InlineKeyboardButton(cat, callback_data=f"out|{amount}|{cat}")]
+                for cat in OUT_CATEGORIES]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Tiền đã dùng vào đâu?", reply_markup=reply_markup)
 
-# Xử lý lựa chọn danh mục
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# === Callback for category selection ===
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
-    if user_id in pending_data:
-        amount = pending_data[user_id]["amount"]
-        action = pending_data[user_id]["type"]
-        category = query.data
-        save_transaction_to_sheets(user_id, amount, category, action)
-        await query.edit_message_text(f"✅ Đã ghi {'thu' if action == 'in' else 'chi'}: {amount}đ - {category}")
-        del pending_data[user_id]
-    else:
-        await query.edit_message_text("❌ Không tìm thấy dữ liệu giao dịch.")
+    action, amount, category = query.data.split("|")
+    now = datetime.utcnow() + timedelta(hours=7)  # Giờ VN
+    worksheet.append_row([now.strftime("%Y-%m-%d %H:%M:%S"), action, amount, category])
+    await query.edit_message_text(f"✅ Đã ghi nhận {action.upper()} {amount} vào '{category}'")
 
-# Hàm chạy bot
+# === Daily summary ===
+async def daily_summary(context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.utcnow() + timedelta(hours=7)
+    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    month = now.strftime("%Y-%m")
+
+    data = worksheet.get_all_records()
+    in_yesterday = sum(float(row['amount']) for row in data
+                       if row['type'] == 'in' and row['timestamp'].startswith(yesterday))
+    out_yesterday = sum(float(row['amount']) for row in data
+                        if row['type'] == 'out' and row['timestamp'].startswith(yesterday))
+    in_month = sum(float(row['amount']) for row in data
+                   if row['type'] == 'in' and row['timestamp'].startswith(month))
+    out_month = sum(float(row['amount']) for row in data
+                    if row['type'] == 'out' and row['timestamp'].startswith(month))
+
+    msg = (
+        f"📊 *Tổng kết ngày {yesterday}*\n"
+        f"🟢 Thu hôm qua: {in_yesterday:,.0f} đ\n"
+        f"🔴 Chi hôm qua: {out_yesterday:,.0f} đ\n\n"
+        f"📅 *Tháng này*\n"
+        f"🟢 Tổng thu: {in_month:,.0f} đ\n"
+        f"🔴 Tổng chi: {out_month:,.0f} đ"
+    )
+    await context.bot.send_message(chat_id=context.job.chat_id, text=msg, parse_mode="Markdown")
+
+# === /subscribe ===
+async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    time = datetime.time(hour=8, tzinfo=datetime.timezone(timedelta(hours=7)))
+    context.job_queue.run_daily(daily_summary, time=time, chat_id=chat_id)
+    await update.message.reply_text("✅ Bạn đã đăng ký nhận báo cáo hằng ngày lúc 8h sáng.")
+
+# === Main ===
 async def main():
-    import os
-    TOKEN = os.getenv("BOT_TOKEN")
-    app = Application.builder().token(TOKEN).build()
+    BOT_TOKEN = os.getenv("BOT_TOKEN")
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("in", income))
-    app.add_handler(CommandHandler("out", expense))
-    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(CommandHandler("in", handle_in))
+    app.add_handler(CommandHandler("out", handle_out))
+    app.add_handler(CommandHandler("subscribe", subscribe))
+    app.add_handler(CallbackQueryHandler(button))
 
     await app.run_polling()
 
-if __name__ == '__main__':
-    import asyncio
+if __name__ == "__main__":
     asyncio.run(main())
